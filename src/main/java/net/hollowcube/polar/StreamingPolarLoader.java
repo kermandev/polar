@@ -156,7 +156,7 @@ final class StreamingPolarLoader {
         if (version > PolarWorld.VERSION_WORLD_USERDATA) {
             int userDataLength = buffer.read(VAR_INT);
             if (worldAccess != null) {
-                var worldDataView = buffer.slice(buffer.readIndex(), userDataLength, 0, userDataLength);
+                var worldDataView = buffer.slice(buffer.readIndex(), userDataLength, 0, userDataLength).readOnly();
                 worldAccess.loadWorldData(instance, worldDataView);
             }
             buffer.advanceRead(userDataLength);
@@ -214,7 +214,7 @@ final class StreamingPolarLoader {
         if (version > PolarWorld.VERSION_USERDATA_OPT_BLOCK_ENT_NBT) {
             int userDataLength = buffer.read(VAR_INT);
             if (worldAccess != null) {
-                var chunkDataView = buffer.slice(buffer.readIndex(), userDataLength, 0, userDataLength);
+                var chunkDataView = buffer.slice(buffer.readIndex(), userDataLength, 0, userDataLength).readOnly();
                 worldAccess.loadChunkData(chunk, chunkDataView);
             }
             buffer.advanceRead(userDataLength);
