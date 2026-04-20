@@ -12,12 +12,16 @@ import net.minestom.server.instance.InstanceContainer;
 import net.minestom.server.instance.Section;
 import net.minestom.server.instance.block.Block;
 import net.minestom.server.network.NetworkBuffer;
+import net.minestom.server.network.NetworkBufferAllocator;
+import net.minestom.server.network.foreign.NetworkBufferSegmentProvider;
 import net.minestom.server.utils.validate.Check;
 import net.minestom.server.world.biome.Biome;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
+import java.lang.foreign.Arena;
+import java.nio.channels.FileChannel;
 import java.nio.channels.ReadableByteChannel;
 import java.util.Objects;
 
@@ -26,8 +30,6 @@ import static net.hollowcube.polar.PolarReader.*;
 import static net.hollowcube.polar.UnsafeOps.*;
 import static net.minestom.server.instance.Chunk.CHUNK_SECTION_SIZE;
 import static net.minestom.server.network.NetworkBuffer.*;
-import static net.minestom.server.network.PolarBufferAccessWidener.networkBufferAddress;
-import static net.minestom.server.network.PolarBufferAccessWidener.networkBufferView;
 
 final class StreamingPolarLoader {
     private final InstanceContainer instance;
@@ -57,9 +59,96 @@ final class StreamingPolarLoader {
         }
     }
 
-    public void loadAllSequential(@NotNull ReadableByteChannel channel, long fileSize) throws IOException {
-        final var buffer = readHeader(channel, fileSize);
+    record CompressedDataInfo(PolarWorld.CompressionType compressionType, int dataLength) {}
 
+    @SuppressWarnings({"UnstableApiUsage"}) // Arena api is marked as experimental
+    public void loadAllSequential(@NotNull ReadableByteChannel channel, long fileSize) throws IOException {
+        try (Arena dstArena = Arena.ofConfined()) {
+            final var dstAllocator = NetworkBufferAllocator.staticAllocator()
+                    .arena(dstArena)
+                    .registry(MinecraftServer.process());
+            final NetworkBuffer dst;
+            try (Arena srcArena = Arena.ofConfined()) {
+                final NetworkBuffer src; // We branch on the type of channel to avoid unnecessary copying to user space.
+                if (channel instanceof FileChannel fileChannel) {
+                    var mappedSegment = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0L, fileSize, srcArena);
+                    src = NetworkBuffer.wrap(mappedSegment, 0, fileSize).readOnly();
+                } else {
+                    var buffer = NetworkBufferAllocator.staticAllocator()
+                            .arena(srcArena)
+                            .registry(MinecraftServer.process())
+                            .allocate(fileSize);
+                    buffer.readChannel(channel);
+                    src = buffer.readOnly();
+                }
+                final var compressedData = readHeader(src);
+                switch (compressedData.compressionType()) {
+                    case NONE -> {
+                        readData(src);
+                        return;
+                    }
+                    // src should be unreachable following the dst copy.
+                    case ZSTD -> dst = decompressZstdData(dstAllocator, src, compressedData.dataLength());
+                    default -> throw new UnsupportedOperationException("Unsupported compression type: " + compressedData.compressionType());
+                }
+            } // src is deallocated
+            // Now we can just read the dst buffer without having to worry about the extra footprint of src
+            readData(dst);
+        }
+    }
+
+    /**
+     * Reads the header and returns the compression information for the data block.
+     *
+     * <p>Always populates {@link #version} and {@link #dataVersion}.</p>
+     */
+    private CompressedDataInfo readHeader(NetworkBuffer buffer) {
+        var magicNumber = buffer.read(INT);
+        assertThat(magicNumber == PolarWorld.MAGIC_NUMBER, "Invalid magic number");
+
+        this.version = buffer.read(SHORT);
+        validateVersion(this.version);
+        this.dataVersion = version >= PolarWorld.VERSION_DATA_CONVERTER
+                ? buffer.read(VAR_INT)
+                : dataConverter.defaultDataVersion();
+
+        var compressionType = PolarWorld.CompressionType.fromId(buffer.read(BYTE));
+        assertThat(compressionType != null, "Invalid compression type");
+        int dataLength = buffer.read(VAR_INT);
+        return new CompressedDataInfo(compressionType, dataLength);
+    }
+
+    /**
+     * Decompresses the Zstd data from the source buffer into a buffer using the provided allocator.
+     *
+     * @param dstAllocator the network buffer allocator to use for decompression
+     * @param src the network buffer containing the compressed data
+     * @param dataLength the length of the decompressed data, in bytes.
+     * @return a network buffer containing the decompressed data
+     */
+    @SuppressWarnings({"UnstableApiUsage"}) // Provider#segment api is marked as experimental
+    private NetworkBuffer decompressZstdData(@NotNull NetworkBufferAllocator dstAllocator, @NotNull NetworkBuffer src, int dataLength) {
+        // This is using some internals of Minestom, so worth an explanation. As of 26.1, network buffer is
+        // backed by a directly backed via MemorySegment. Zstd supports direct decompression using Unsafe,
+        // so we can use the direct addresses of the two buffers for decompression.
+        final var dst = dstAllocator.allocate(dataLength);
+        final var srcAddress = NetworkBufferSegmentProvider.segment(src).address() + src.readIndex();
+        final var dstAddress = NetworkBufferSegmentProvider.segment(dst).address();
+        long count = Zstd.decompressUnsafe(dstAddress, dataLength, srcAddress,
+                src.readableBytes());
+        if (Zstd.isError(count)) {
+            throw new RuntimeException("decompression failed: " + Zstd.getErrorName(count));
+        }
+        dst.writeIndex(dataLength);
+        return dst.readOnly();
+    }
+
+    /**
+     * Loads all chunks in the instance and user data.
+     *
+     * @param buffer the network buffer containing the decompressed data
+     */
+    private void readData(@NotNull NetworkBuffer buffer) {
         byte minSection = buffer.read(BYTE), maxSection = buffer.read(BYTE);
         assertThat(minSection < maxSection, "Invalid section range");
 
@@ -67,7 +156,7 @@ final class StreamingPolarLoader {
         if (version > PolarWorld.VERSION_WORLD_USERDATA) {
             int userDataLength = buffer.read(VAR_INT);
             if (worldAccess != null) {
-                var worldDataView = networkBufferView(buffer, buffer.readIndex(), userDataLength);
+                var worldDataView = buffer.slice(buffer.readIndex(), userDataLength, 0, userDataLength);
                 worldAccess.loadWorldData(instance, worldDataView);
             }
             buffer.advanceRead(userDataLength);
@@ -80,49 +169,6 @@ final class StreamingPolarLoader {
         }
 
         Check.stateCondition(buffer.readableBytes() > 0, "Unexpected extra data at end of buffer");
-    }
-
-    /**
-     * Reads the header and returns a network buffer containing the decompressed content.
-     *
-     * <p>Always populates {@link #version} and {@link #dataVersion}.</p>
-     */
-    private NetworkBuffer readHeader(@NotNull ReadableByteChannel channel, long fileSize) throws IOException {
-        final var buffer = NetworkBuffer.staticBuffer(fileSize, MinecraftServer.process());
-        buffer.readChannel(channel);
-
-        var magicNumber = buffer.read(INT);
-        assertThat(magicNumber == PolarWorld.MAGIC_NUMBER, "Invalid magic number");
-
-        this.version = buffer.read(SHORT);
-        validateVersion(this.version);
-        this.dataVersion = version >= PolarWorld.VERSION_DATA_CONVERTER
-                ? buffer.read(VAR_INT)
-                : dataConverter.defaultDataVersion();
-
-        var compression = PolarWorld.CompressionType.fromId(buffer.read(BYTE));
-        assertThat(compression != null, "Invalid compression type");
-        var compressedDataLength = buffer.read(VAR_INT);
-
-        return switch (compression) {
-            case NONE -> buffer;
-            case ZSTD -> {
-                // This is using some internals of Minestom, so worth an explanation. As of 1.21.3, network buffer is
-                // backed by a directly allocated array via Unsafe. Zstd supports direct decompression, so we can use
-                // the direct addresses of the two buffers for decompression.
-                final var dst = NetworkBuffer.staticBuffer(compressedDataLength, MinecraftServer.process());
-                final var srcAddress = networkBufferAddress(buffer) + buffer.readIndex();
-                final var dstAddress = networkBufferAddress(dst);
-                long count = Zstd.decompressUnsafe(dstAddress, compressedDataLength, srcAddress,
-                                                   buffer.readableBytes());
-                if (Zstd.isError(count)) {
-                    throw new RuntimeException("decompression failed: " + Zstd.getErrorName(count));
-                }
-                dst.writeIndex(compressedDataLength);
-                yield dst;
-                // The original buffer is useless and may be collected at this point.
-            }
-        };
     }
 
     private void readChunk(@NotNull NetworkBuffer buffer, int minSection, int maxSection) {
@@ -168,7 +214,7 @@ final class StreamingPolarLoader {
         if (version > PolarWorld.VERSION_USERDATA_OPT_BLOCK_ENT_NBT) {
             int userDataLength = buffer.read(VAR_INT);
             if (worldAccess != null) {
-                var chunkDataView = networkBufferView(buffer, buffer.readIndex(), userDataLength);
+                var chunkDataView = buffer.slice(buffer.readIndex(), userDataLength, 0, userDataLength);
                 worldAccess.loadChunkData(chunk, chunkDataView);
             }
             buffer.advanceRead(userDataLength);
