@@ -4,6 +4,7 @@ import com.github.luben.zstd.Zstd;
 import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
 import it.unimi.dsi.fastutil.objects.Object2IntMap;
 import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
+import net.minestom.server.MinecraftServer;
 import net.minestom.server.command.builder.arguments.minecraft.ArgumentBlockState;
 import net.minestom.server.command.builder.exception.ArgumentSyntaxException;
 import net.minestom.server.coordinate.CoordConversion;
@@ -77,7 +78,7 @@ final class StreamingPolarLoader {
                     }
                     src = segment.asReadOnly();
                 }
-                var buffer = NetworkBuffer.wrap(src, 0, fileSize);
+                var buffer = NetworkBuffer.wrap(src, 0, fileSize, MinecraftServer.process());
                 var magicNumber = buffer.read(INT);
                 assertThat(magicNumber == PolarWorld.MAGIC_NUMBER, "Invalid magic number");
                 this.version = buffer.read(SHORT);
@@ -97,13 +98,17 @@ final class StreamingPolarLoader {
                     // src should be unreachable following the dst copy.
                     case ZSTD -> {
                         var decompression = dstArena.allocate(dataLength);
-                        long count = Zstd.decompressUnsafe(decompression.address(), decompression.byteSize(), src.address(), src.byteSize());
+                        long count = Zstd.decompressUnsafe(decompression.address(), decompression.byteSize(),
+                                                           src.address() + buffer.readIndex(),
+                                                           src.byteSize() - buffer.readIndex());
                         if (Zstd.isError(count)) {
                             throw new RuntimeException("decompression failed: " + Zstd.getErrorName(count));
                         }
+                        assertThat(count == dataLength, "Decompressed size does not match expected length");
                         dst = decompression.asReadOnly();
                     }
-                    default -> throw new UnsupportedOperationException("Unsupported compression type: " + compressionType);
+                    default ->
+                            throw new UnsupportedOperationException("Unsupported compression type: " + compressionType);
                 }
             } // src is deallocated
             // Now we can just read the dst buffer without having to worry about the extra footprint of src
@@ -117,7 +122,7 @@ final class StreamingPolarLoader {
      * @param segment the network buffer containing the decompressed data
      */
     private void readData(@NotNull MemorySegment segment) {
-        var buffer = NetworkBuffer.wrap(segment, 0, segment.byteSize());
+        var buffer = NetworkBuffer.wrap(segment, 0, segment.byteSize(), MinecraftServer.process());
         byte minSection = buffer.read(BYTE), maxSection = buffer.read(BYTE);
         assertThat(minSection < maxSection, "Invalid section range");
 
@@ -125,7 +130,8 @@ final class StreamingPolarLoader {
         if (version > PolarWorld.VERSION_WORLD_USERDATA) {
             int userDataLength = buffer.read(VAR_INT);
             if (worldAccess != null) {
-                var worldDataView = NetworkBuffer.wrap(segment.asSlice(buffer.readIndex(), userDataLength), 0L, userDataLength);
+                var worldDataView = NetworkBuffer.wrap(segment.asSlice(buffer.readIndex(), userDataLength), 0L,
+                                                       userDataLength, MinecraftServer.process());
                 worldAccess.loadWorldData(instance, worldDataView);
             }
             buffer.advanceRead(userDataLength);
@@ -140,7 +146,8 @@ final class StreamingPolarLoader {
         Check.stateCondition(buffer.readableBytes() > 0, "Unexpected extra data at end of buffer");
     }
 
-    private void readChunk(@NotNull MemorySegment segment, @NotNull NetworkBuffer buffer, int minSection, int maxSection) {
+    private void readChunk(
+            @NotNull MemorySegment segment, @NotNull NetworkBuffer buffer, int minSection, int maxSection) {
         final var chunkX = buffer.read(VAR_INT);
         final var chunkZ = buffer.read(VAR_INT);
         final var chunk = instance.getChunkSupplier().createChunk(instance, chunkX, chunkZ);
@@ -149,7 +156,8 @@ final class StreamingPolarLoader {
         var chunkTickables = unsafeGetTickableMap(chunk);
 
         // Load block data
-        synchronized (chunk) {
+        chunk.lockWriteLock();
+        try {
             for (int sectionY = minSection; sectionY <= maxSection; sectionY++) {
                 readSection(buffer, chunk.getSection(sectionY), sectionY, chunkEntries);
             }
@@ -174,6 +182,8 @@ final class StreamingPolarLoader {
             int[][] heightmaps = readHeightmapData(buffer, worldAccess == null);
             if (worldAccess != null) worldAccess.loadHeightmaps(chunk, heightmaps);
             else unsafeSetNeedsCompleteHeightmapRefresh(chunk, true);
+        } finally {
+            chunk.unlockWriteLock();
         }
 
         unsafeChunkOnLoad(chunk);
@@ -183,7 +193,8 @@ final class StreamingPolarLoader {
         if (version > PolarWorld.VERSION_USERDATA_OPT_BLOCK_ENT_NBT) {
             int userDataLength = buffer.read(VAR_INT);
             if (worldAccess != null) {
-                var chunkDataView = NetworkBuffer.wrap(segment.asSlice(buffer.readIndex(), userDataLength), 0L, userDataLength);
+                var chunkDataView = NetworkBuffer.wrap(segment.asSlice(buffer.readIndex(), userDataLength), 0L,
+                                                       userDataLength, MinecraftServer.process());
                 worldAccess.loadChunkData(chunk, chunkDataView);
             }
             buffer.advanceRead(userDataLength);
